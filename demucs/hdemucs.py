@@ -4,7 +4,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 """
-This code contains the spectrogram and Hybrid version of Demucs.
+HDemucs: Spectrogram and Hybrid Demucs for Music Source Separation
+
+WHAT: This module implements two variants of Demucs that operate in the frequency (spectrogram)
+domain instead of raw waveform:
+  1. Spectrogram Demucs: All layers operate on spectrograms until frequency dimension collapses.
+  2. Hybrid Demucs: Parallel time-domain and frequency-domain branches that merge at the bottleneck.
+
+WHY: Spectrogram models can capture harmonic structure more efficiently; hybrid models combine
+the best of both domains (time-domain temporal resolution + frequency-domain harmonic modeling).
+
+HOW: Input audio is transformed via STFT, processed through encoder-decoder U-Net architectures
+with optional Wiener filtering or Complex-as-Channels (CaC) for reconstruction.
 """
 from copy import deepcopy
 import math
@@ -21,15 +32,22 @@ from .spec import spectro, ispectro
 
 
 def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'constant', value: float = 0.):
-    """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
-    If this is the case, we insert extra 0 padding to the right before the reflection happen."""
+    """
+    WHAT: 1D padding wrapper that extends F.pad with support for reflect padding on short inputs.
+    WHY: PyTorch's reflect mode requires input length > padding size; otherwise it raises an error.
+          Short segments (e.g. end of audio) would fail without this workaround.
+    HOW: If mode='reflect' and input is too short, we first pad with zeros to meet the minimum
+         length, then apply the requested reflection padding. The original valid region is preserved.
+    """
     x0 = x
     length = x.shape[-1]
     padding_left, padding_right = paddings
+    # Reflect mode fails when length <= pad: can't reflect from empty/small buffer
     if mode == 'reflect':
         max_pad = max(padding_left, padding_right)
         if length <= max_pad:
             extra_pad = max_pad - length + 1
+            # Pre-pad with zeros so total length > max_pad, then reduce reflect padding
             extra_pad_right = min(padding_right, extra_pad)
             extra_pad_left = extra_pad - extra_pad_right
             paddings = (padding_left - extra_pad_left, padding_right - extra_pad_right)
@@ -42,18 +60,24 @@ def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'constant',
 
 class ScaledEmbedding(nn.Module):
     """
-    Boost learning rate for embeddings (with `scale`).
-    Also, can make embeddings continuous with `smooth`.
+    WHAT: Embedding layer with configurable scale and optional smooth initialization.
+    WHY: Standard embeddings have small gradients; scaling boosts learning signal. Smooth init
+         creates continuous frequency representations (cumulative sum) for better generalization
+         across neighboring frequency bins [Isik et al. 2020].
+    HOW: Stores scaled-down weights; forward multiplies by scale. Smooth mode initializes with
+         normalized cumulative sum so adjacent indices have similar values.
     """
     def __init__(self, num_embeddings: int, embedding_dim: int,
                  scale: float = 10., smooth=False):
         super().__init__()
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         if smooth:
+            # Cumulative sum: adjacent freq bins get similar values (smooth across frequency)
             weight = torch.cumsum(self.embedding.weight.data, dim=0)
-            # when summing gaussian, overscale raises as sqrt(n), so we nornalize by that.
+            # Normalize: sum of n terms scales as sqrt(n), so divide by sqrt(n)
             weight = weight / torch.arange(1, num_embeddings + 1).to(weight).sqrt()[:, None]
             self.embedding.weight.data[:] = weight
+        # Store small weights, scale up at forward - effectively boosts embedding gradient
         self.embedding.weight.data /= scale
         self.scale = scale
 
@@ -67,11 +91,17 @@ class ScaledEmbedding(nn.Module):
 
 
 class HEncLayer(nn.Module):
+    """
+    WHAT: Single encoder layer for HDemucs - downsamples and compresses features.
+    WHY: Shared design for both time and freq branches reduces code duplication; the `freq` flag
+         switches between Conv1d (time) and Conv2d (frequency) - freq axis is preserved in 2D.
+    HOW: Conv -> Norm -> (optional DConv residual) -> (optional 1x1 rewrite with GLU).
+         DConv provides dilated temporal context; rewrite adds channel mixing before next layer.
+    """
     def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, empty=False,
                  freq=True, dconv=True, norm=True, context=0, dconv_kw={}, pad=True,
                  rewrite=True):
-        """Encoder layer. This used both by the time and the frequency branch.
-
+        """
         Args:
             chin: number of input channels.
             chout: number of output channels.
@@ -122,13 +152,18 @@ class HEncLayer(nn.Module):
 
     def forward(self, x, inject=None):
         """
-        `inject` is used to inject the result from the time branch into the frequency branch,
-        when both have the same stride.
+        WHAT: Forward pass with optional cross-branch injection.
+        WHY: At the merge point (when freq collapses to 1), time and freq branches have aligned
+             shapes - inject adds time-branch features into freq branch before they unify.
+        HOW: inject is added to conv output before norm; handles dim mismatch (3D vs 4D) via
+             unsqueeze. DConv operates on flattened (B*Fr, C, T) for freq layers.
         """
+        # Time branch may receive 4D from freq collapse: flatten (B,C,Fr,T) -> (B,C*Fr,T)
         if not self.freq and x.dim() == 4:
             B, C, Fr, T = x.shape
             x = x.view(B, -1, T)
 
+        # Time branch: ensure length is divisible by stride for clean downsampling
         if not self.freq:
             le = x.shape[-1]
             if not le % self.stride == 0:
@@ -142,6 +177,7 @@ class HEncLayer(nn.Module):
                 inject = inject[:, :, None]
             y = y + inject
         y = F.gelu(self.norm1(y))
+        # DConv: dilated conv over time. For freq, treat each freq bin as batch (B*Fr, C, T)
         if self.dconv:
             if self.freq:
                 B, C, Fr, T = y.shape
@@ -149,6 +185,7 @@ class HEncLayer(nn.Module):
             y = self.dconv(y)
             if self.freq:
                 y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+        # Rewrite: 1x1 conv doubles channels, GLU halves - gating for channel mixing
         if self.rewrite:
             z = self.norm2(self.rewrite(y))
             z = F.glu(z, dim=1)
@@ -159,12 +196,12 @@ class HEncLayer(nn.Module):
 
 class MultiWrap(nn.Module):
     """
-    Takes one layer and replicate it N times. each replica will act
-    on a frequency band. All is done so that if the N replica have the same weights,
-    then this is exactly equivalent to applying the original module on all frequencies.
-
-    This is a bit over-engineered to avoid edge artifacts when splitting
-    the frequency bands, but it is possible the naive implementation would work as well...
+    WHAT: Wraps a layer to process frequency bands separately with independent copies.
+    WHY: Enables different processing per band (e.g. bass vs treble); when weights are shared,
+         behavior equals applying one layer to full spectrum - used for multi-resolution processing.
+    HOW: Splits input by split_ratios (e.g. [0.25, 0.5] -> 3 bands), applies per-band layer
+         copies with careful overlap handling to avoid edge artifacts at band boundaries.
+         Encoder: pad bands, process, stitch. Decoder: overlap-add at boundaries for smooth reconstruction.
     """
     def __init__(self, layer, split_ratios):
         """
@@ -194,7 +231,7 @@ class MultiWrap(nn.Module):
 
     def forward(self, x, skip=None, length=None):
         B, C, Fr, T = x.shape
-
+        # ratios define band boundaries: [0.25, 0.5] -> bands 0-25%, 25-50%, 50-100% of freq
         ratios = list(self.split_ratios) + [1]
         start = 0
         outs = []
@@ -233,6 +270,7 @@ class MultiWrap(nn.Module):
                 y = x[:, :, start:limit]
                 s = skip[:, :, start:limit]
                 out, _ = layer(y, s, None)
+                # Overlap-add at band boundaries: blend previous band's tail with current band's head
                 if outs:
                     outs[-1][:, :, -layer.stride:] += (
                         out[:, :, :layer.stride] - layer.conv_tr.bias.view(1, -1, 1, 1))
@@ -254,11 +292,18 @@ class MultiWrap(nn.Module):
 
 
 class HDecLayer(nn.Module):
+    """
+    WHAT: Decoder layer - mirrors HEncLayer, upsamples and reconstructs from skip connections.
+    WHY: U-Net structure requires symmetric decoder; skip connections preserve high-res details.
+    HOW: Skip+rewrite -> DConv -> ConvTranspose. Trims padding to match target length.
+         empty=True for merge layer: only transposed conv, no skip (time branch feeds in).
+    """
     def __init__(self, chin, chout, last=False, kernel_size=8, stride=4, norm_groups=1, empty=False,
                  freq=True, dconv=True, norm=True, context=1, dconv_kw={}, pad=True,
                  context_freq=True, rewrite=True):
         """
         Same as HEncLayer but for decoder. See `HEncLayer` for documentation.
+        context_freq: if True, 1x1 context is on freq axis; else on time axis (for MultiWrap).
         """
         super().__init__()
         norm_fn = lambda d: nn.Identity()  # noqa
@@ -302,6 +347,7 @@ class HDecLayer(nn.Module):
             self.dconv = DConv(chin, **dconv_kw)
 
     def forward(self, x, skip, length):
+        # After merge, x may be 3D (time-only); reshape to 4D for freq layers
         if self.freq and x.dim() == 3:
             B, C, T = x.shape
             x = x.view(B, self.chin, -1, T)
@@ -324,6 +370,7 @@ class HDecLayer(nn.Module):
             y = x
             assert skip is None
         z = self.norm2(self.conv_tr(y))
+        # Trim transposed conv padding to match target length
         if self.freq:
             if self.pad:
                 z = z[..., self.pad:-self.pad, :]
@@ -483,28 +530,33 @@ class HDemucs(nn.Module):
             self.tencoder = nn.ModuleList()
             self.tdecoder = nn.ModuleList()
 
+        # Channel counts: freq branch (z) uses 2x channels when CaC (real+imag per complex)
         chin = audio_channels
         chin_z = chin  # number of channels for the freq branch
         if self.cac:
-            chin_z *= 2
+            chin_z *= 2  # CaC: 2 channels per complex number (real, imag)
         chout = channels_time or channels
         chout_z = channels
-        freqs = nfft // 2
+        freqs = nfft // 2  # Frequency bins (Nyquist excluded)
 
+        # Build encoder and decoder layer by layer
         for index in range(depth):
+            # Progressive depth: add LSTM, attention, norm in deeper layers
             lstm = index >= dconv_lstm
             attn = index >= dconv_attn
             norm = index >= norm_starts
-            freq = freqs > 1
+            freq = freqs > 1  # Still in frequency domain until freqs collapses to 1
             stri = stride
             ker = kernel_size
             if not freq:
+                # Switched to time-only: use different kernel/stride for final time layer
                 assert freqs == 1
                 ker = time_stride * 2
                 stri = time_stride
 
             pad = True
             last_freq = False
+            # Last freq layer: kernel covers entire freq axis, no padding needed
             if freq and freqs <= kernel_size:
                 ker = freqs
                 pad = False
@@ -552,6 +604,7 @@ class HDemucs(nn.Module):
             if multi:
                 enc = MultiWrap(enc, multi_freqs)
             self.encoder.append(enc)
+            # Decoder output channels: one group per source (e.g. 4 sources = 4x channels)
             if index == 0:
                 chin = self.audio_channels * len(self.sources)
                 chin_z = chin
@@ -567,24 +620,33 @@ class HDemucs(nn.Module):
                 self.tdecoder.insert(0, tdec)
             self.decoder.insert(0, dec)
 
+            # Prepare for next layer: propagate channels, reduce freq resolution
             chin = chout
             chin_z = chout_z
             chout = int(growth * chout)
             chout_z = int(growth * chout_z)
             if freq:
                 if freqs <= kernel_size:
-                    freqs = 1
+                    freqs = 1  # Collapse to time-only
                 else:
-                    freqs //= stride
+                    freqs //= stride  # Downsample frequency axis
             if index == 0 and freq_emb:
                 self.freq_emb = ScaledEmbedding(
                     freqs, chin_z, smooth=emb_smooth, scale=emb_scale)
                 self.freq_emb_scale = freq_emb
 
+        # Weight scaling trick: helps training stability for deep networks
         if rescale:
             rescale_module(self, reference=rescale)
 
     def _spec(self, x):
+        """
+        WHAT: Convert time-domain waveform to spectrogram (STFT).
+        WHY: Frequency-domain processing captures harmonic structure; hybrid needs exact alignment
+             so time and freq branches can merge - hence custom padding instead of torch.stft.
+        HOW: For hybrid: pad by nfft/4 convention so output size = input_size/hop_length when
+             divisible. spectro() computes STFT; [..., :-1, :] drops Nyquist bin (redundant).
+        """
         hl = self.hop_length
         nfft = self.nfft
         x0 = x  # noqa
@@ -612,6 +674,12 @@ class HDemucs(nn.Module):
         return z
 
     def _ispec(self, z, length=None, scale=0):
+        """
+        WHAT: Inverse STFT - convert spectrogram back to waveform.
+        WHY: Loss is computed in time domain; iSTFT enables end-to-end gradient flow.
+        HOW: Pad freq (restore Nyquist), then time padding for hybrid alignment. ispectro()
+             performs overlap-add; trim to target length for hybrid mode.
+        """
         hl = self.hop_length // (4 ** scale)
         z = F.pad(z, (0, 0, 0, 1))
         if self.hybrid:
@@ -631,8 +699,11 @@ class HDemucs(nn.Module):
         return x
 
     def _magnitude(self, z):
-        # return the magnitude of the spectrogram, except when cac is True,
-        # in which case we just move the complex dimension to the channel one.
+        """
+        WHAT: Extract magnitude or complex-as-channels representation from spectrogram.
+        WHY: CaC keeps phase info in channels for better separation; magnitude-only loses it.
+        HOW: CaC: view_as_real + reshape to (B, C*2, Fr, T). Otherwise: z.abs().
+        """
         if self.cac:
             B, C, Fr, T = z.shape
             m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
@@ -642,8 +713,12 @@ class HDemucs(nn.Module):
         return m
 
     def _mask(self, z, m):
-        # Apply masking given the mixture spectrogram `z` and the estimated mask `m`.
-        # If `cac` is True, `m` is actually a full spectrogram and `z` is ignored.
+        """
+        WHAT: Apply estimated mask/magnitude to produce separated spectrograms.
+        WHY: Model outputs magnitude estimates; we need complex output for iSTFT.
+        HOW: CaC: m is full complex spec, reshape and return. Wiener: iterative refinement.
+             Naive: z * m/|z| (magnitude masking, preserves mix phase).
+        """
         niters = self.wiener_iters
         if self.cac:
             B, S, C, Fr, T = m.shape
@@ -659,7 +734,13 @@ class HDemucs(nn.Module):
             return self._wiener(m, z, niters)
 
     def _wiener(self, mag_out, mix_stft, niters):
-        # apply wiener filtering from OpenUnmix.
+        """
+        WHAT: Wiener filtering - iterative refinement of source separation using mix phase.
+        WHY: Improves separation quality by refining magnitude estimates while using observed
+             phase; [Ulhih et al. 2017] - classic technique for multichannel separation.
+        HOW: Process in windows (300 frames) to limit memory; OpenUnmix wiener() does EM-style
+             iterations. Permute to (T, Fq, C, S) for wiener API, then permute back.
+        """
         init = mix_stft.dtype
         wiener_win_len = 300
         residual = self.wiener_residual
@@ -687,16 +768,24 @@ class HDemucs(nn.Module):
         return out.to(init)
 
     def forward(self, mix):
+        """
+        WHAT: Full forward pass: mix -> separated sources (e.g. drums, bass, other, vocals).
+        WHY: U-Net encoder-decoder with skip connections; hybrid adds time branch for temporal detail.
+        HOW: STFT -> normalize -> encode (freq + optional time) -> zero bottleneck -> decode with
+             skips -> denormalize -> mask/Wiener -> iSTFT. For hybrid, time output is added to
+             freq output before final iSTFT.
+        """
         x = mix
         length = x.shape[-1]
 
+        # STFT and convert to magnitude (or CaC). This becomes freq branch input.
         z = self._spec(mix)
         mag = self._magnitude(z).to(mix.device)
         x = mag
 
         B, C, Fq, T = x.shape
 
-        # unlike previous Demucs, we always normalize because it is easier.
+        # Normalize for stable training. Unlike waveform Demucs, always applied (no resampling).
         mean = x.mean(dim=(1, 2, 3), keepdim=True)
         std = x.std(dim=(1, 2, 3), keepdim=True)
         x = (x - mean) / (1e-5 + std)
@@ -709,25 +798,23 @@ class HDemucs(nn.Module):
             stdt = xt.std(dim=(1, 2), keepdim=True)
             xt = (xt - meant) / (1e-5 + stdt)
 
-        # okay, this is a giant mess I know...
-        saved = []  # skip connections, freq.
-        saved_t = []  # skip connections, time.
-        lengths = []  # saved lengths to properly remove padding, freq branch.
-        lengths_t = []  # saved lengths for time branch.
+        # U-Net skip connections: save encoder outputs for decoder
+        saved = []  # skip connections, freq. branch
+        saved_t = []  # skip connections, time. branch (hybrid only)
+        lengths = []  # saved lengths to trim padding in decoder, freq branch
+        lengths_t = []  # saved lengths for time branch
         for idx, encode in enumerate(self.encoder):
             lengths.append(x.shape[-1])
             inject = None
             if self.hybrid and idx < len(self.tencoder):
-                # we have not yet merged branches.
+                # Time branch runs in parallel until merge (when empty=True)
                 lengths_t.append(xt.shape[-1])
                 tenc = self.tencoder[idx]
                 xt = tenc(xt)
                 if not tenc.empty:
-                    # save for skip connection
-                    saved_t.append(xt)
+                    saved_t.append(xt)  # Skip for tdecoder
                 else:
-                    # tenc contains just the first conv., so that now time and freq.
-                    # branches have the same shape and can be merged.
+                    # Merge: time output has same stride as freq; inject into freq encoder
                     inject = xt
             x = encode(x, inject)
             if idx == 0 and self.freq_emb is not None:
@@ -739,10 +826,11 @@ class HDemucs(nn.Module):
 
             saved.append(x)
 
+        # Bottleneck: zero-initialize. All information flows through skip connections
+        # (U-Net design - encoder encodes, decoder reconstructs from skips).
         x = torch.zeros_like(x)
         if self.hybrid:
             xt = torch.zeros_like(x)
-        # initialize everything to zero (signal will go through u-net skips).
 
         for idx, decode in enumerate(self.decoder):
             skip = saved.pop(-1)
@@ -750,6 +838,7 @@ class HDemucs(nn.Module):
             # `pre` contains the output just before final transposed convolution,
             # which is used when the freq. and time branch separate.
 
+            # Time decoder: starts when freq decoder reaches merge layer (fewer tdec layers)
             if self.hybrid:
                 offset = self.depth - len(self.tdecoder)
             if self.hybrid and idx >= offset:
@@ -760,6 +849,7 @@ class HDemucs(nn.Module):
                     pre = pre[:, :, 0]
                     xt, _ = tdec(pre, None, length_t)
                 else:
+                    # Normal tdec layer: use skip from time encoder
                     skip = saved_t.pop(-1)
                     xt, _ = tdec(xt, skip, length_t)
 
@@ -768,11 +858,12 @@ class HDemucs(nn.Module):
         assert len(lengths_t) == 0
         assert len(saved_t) == 0
 
+        # Reshape to (B, S, C, Fq, T) and denormalize
         S = len(self.sources)
         x = x.view(B, S, -1, Fq, T)
         x = x * std[:, None] + mean[:, None]
 
-        # to cpu as mps doesnt support complex numbers
+        # Move to CPU for complex ops: MPS/XPU don't support complex numbers (demucs #435, #432)
         # demucs issue #435 ##432
         # NOTE: in this case z already is on cpu
         # TODO: remove this when mps supports complex numbers
@@ -784,11 +875,10 @@ class HDemucs(nn.Module):
         zout = self._mask(z, x)
         x = self._ispec(zout, length)
 
-        # back to mps device
         if x_is_mps_xpu:
             x = x.to(x_device)
-        
 
+        # Hybrid: add time-branch output to freq-branch output (both are separated sources)
         if self.hybrid:
             xt = xt.view(B, S, -1, length)
             xt = xt * stdt[:, None] + meant[:, None]

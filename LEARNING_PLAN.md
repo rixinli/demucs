@@ -30,6 +30,8 @@
 | v3 | HDemucs | Hybrid | Dual U-Net: time + spectrogram branches |
 | v4 | HTDemucs | Hybrid + Transformer | Cross-domain Transformer between encoders |
 
+**HTDemucs in depth:** See [docs/htdemucs_comparison.md](docs/htdemucs_comparison.md) for a detailed comparison of Demucs, HDemucs, and HTDemucs — bottlenecks, DConv differences, and why the Transformer was added.
+
 ---
 
 ## Part II: Why — Design Decisions
@@ -45,9 +47,10 @@
 - Combining both: best of both worlds
 
 ### Why Transformer in v4?
-- Self-attention: global context across time and frequency
-- Cross-attention: information flow between time and freq branches
-- Replaces pure convolution bottleneck → better long-range modeling
+- **Self-attention:** global context within each branch (freq and time)
+- **Cross-attention:** information flow *between* branches — freq attends to time, time attends to freq
+- HDemucs only merges branches (simple inject); HTDemucs enables true interaction via cross-attention
+- Replaces zero bottleneck + LSTM/attention in DConv → better long-range modeling
 
 ### Why Chunking (Segment) at Inference?
 - Full-song forward pass exceeds GPU memory
@@ -132,6 +135,7 @@ When designing your audio model:
 
 ## References
 
+- [docs/htdemucs_comparison.md](docs/htdemucs_comparison.md) — Demucs vs HDemucs vs HTDemucs (bottlenecks, DConv, Transformer)
 - [Hybrid Demucs Paper](https://arxiv.org/abs/2111.03600)
 - [HTDemucs Paper](https://arxiv.org/abs/2211.08553)
 - [Wave-U-Net](https://github.com/f90/Wave-U-Net) (Demucs inspiration)
