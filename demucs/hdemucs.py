@@ -137,7 +137,7 @@ class HEncLayer(nn.Module):
             stride = [stride, 1]
             pad = [pad, 0]
             klass = nn.Conv2d
-        self.conv = klass(chin, chout, kernel_size, stride, pad)
+        self.conv = klass(chin, chout, kernel_size, stride, pad)    
         if self.empty:
             return
         self.norm1 = norm_fn(chout)

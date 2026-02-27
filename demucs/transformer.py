@@ -5,6 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 # First author is Simon Rouard.
 
+"""
+Transformer components for HTDemucs (Hybrid Transformer Demucs).
+
+This module provides:
+  1. Positional embeddings: sinusoidal (1D/2D), CAPE (Contextualized APE)
+  2. Sparse attention masks: diagonal, jmask, random, global — to reduce O(n²) cost
+  3. MyTransformerEncoderLayer: standard self-attention + FFN (within one branch)
+  4. CrossTransformerEncoderLayer: cross-attention (q from one branch, k/v from another)
+  5. CrossTransformerEncoder: alternates self- and cross-attention to fuse freq + time branches
+
+Flow: HTDemucs encoder outputs (freq: B,C,Fr,T, time: B,C,T) → reshape to sequences →
+      CrossTransformerEncoder (alternating layers) → reshape back for decoder.
+"""
 import random
 import typing as tp
 
@@ -19,7 +32,14 @@ from einops import rearrange
 def create_sin_embedding(
     length: int, dim: int, shift: int = 0, device="cpu", max_period=10000
 ):
-    # We aim for TBC format
+    """
+    Create 1D sinusoidal positional encoding (Vaswani et al. "Attention Is All You Need").
+
+    Output format: (length, 1, dim) — TBC style, ready to broadcast over batch.
+    Uses cos/sin at different frequencies so each position has a unique encoding.
+    shift: optional offset (e.g. for data augmentation).
+    max_period: largest wavelength; controls how fast frequencies change along dim.
+    """
     assert dim % 2 == 0
     pos = shift + torch.arange(length, device=device).view(-1, 1, 1)
     half_dim = dim // 2
@@ -36,10 +56,12 @@ def create_sin_embedding(
 
 def create_2d_sin_embedding(d_model, height, width, device="cpu", max_period=10000):
     """
-    :param d_model: dimension of the model
-    :param height: height of the positions
-    :param width: width of the positions
-    :return: d_model*height*width position matrix
+    Create 2D sinusoidal positional encoding for (height × width) grids.
+
+    Used for the FREQ branch: (Fr, T) — each (f, t) position gets a unique encoding
+    by combining encodings along width and height. Half of d_model encodes width,
+    half encodes height.
+    Returns: (1, d_model, height, width) for broadcasting over batch.
     """
     if d_model % 4 != 0:
         raise ValueError(
@@ -82,7 +104,12 @@ def create_sin_embedding_cape(
     device: str = "cpu",
     max_period: float = 10000.0,
 ):
-    # We aim for TBC format
+    """
+    CAPE (Contextualized APE): https://arxiv.org/abs/2106.03143
+    During training: adds random shifts and scale to positions for robustness.
+    During inference: augment=False for deterministic positions.
+    Output: TBC format (T, B, C).
+    """
     assert dim % 2 == 0
     pos = 1.0 * torch.arange(length).view(-1, 1, 1)  # (length, 1, 1)
     pos = pos.repeat(1, batch_size, 1)  # (length, batch_size, 1)
@@ -116,6 +143,7 @@ def create_sin_embedding_cape(
 
 
 def get_causal_mask(length):
+    """Lower triangular mask for autoregressive/causal attention: position i cannot attend to j > i."""
     pos = torch.arange(length)
     return pos > pos[:, None]
 
@@ -131,8 +159,14 @@ def get_elementary_mask(
     device,
 ):
     """
-    When the input of the Decoder has length T1 and the output T2
-    The mask matrix has shape (T2, T1)
+    Build a SPARSE attention mask to reduce O(n²) cost. Mask shape (T2, T1): for query i,
+    only keys j where mask[i,j]=True are attended. T1=key len, T2=query len.
+
+    Mask types:
+      diag: band around diagonal — local + aligned (for cross-attn when T1≈T2)
+      jmask: jittered diagonal pattern
+      random: random subset of edges (sparsity controls density)
+      global: first global_window positions attend to everything (global context)
     """
     assert mask_type in ["diag", "jmask", "random", "global"]
 
@@ -186,8 +220,8 @@ def get_mask(
     device,
 ):
     """
-    Return a SparseCSRTensor mask that is a combination of elementary masks
-    mask_type can be a combination of multiple masks: for instance "diag_jmask_random"
+    Combine multiple elementary masks (OR them). Example: "diag_jmask_random" uses
+    all three patterns. Returns SparseCSRTensor for memory-efficient sparse matmul.
     """
     from xformers.sparse import SparseCSRTensor
     # create a list
@@ -213,6 +247,10 @@ def get_mask(
 
 
 class ScaledEmbedding(nn.Module):
+    """
+    Embedding with scaled output. Weights stored small; forward multiplies by boost.
+    Used for learned positional embeddings (emb="scaled").
+    """
     def __init__(
         self,
         num_embeddings: int,
@@ -234,15 +272,14 @@ class ScaledEmbedding(nn.Module):
 
 
 class LayerScale(nn.Module):
-    """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
-    This rescales diagonaly residual outputs close to 0 initially, then learnt.
+    """
+    Per-channel scaling of residual branches. Init ~0 so residuals start small;
+    scale is learned. Stabilizes deep transformers.
+    Ref: https://arxiv.org/pdf/2103.17239.pdf
     """
 
     def __init__(self, channels: int, init: float = 0, channel_last=False):
-        """
-        channel_last = False corresponds to (B, C, T) tensors
-        channel_last = True corresponds to (T, B, C) tensors
-        """
+        """channel_last=True for (B,T,C); False for (B,C,T)."""
         super().__init__()
         self.channel_last = channel_last
         self.scale = nn.Parameter(torch.zeros(channels, requires_grad=True))
@@ -256,6 +293,10 @@ class LayerScale(nn.Module):
 
 
 class MyGroupNorm(nn.GroupNorm):
+    """
+    GroupNorm that expects (B, T, C) and transposes to (B, C, T) for PyTorch's
+    GroupNorm (which expects channel dim 1). num_groups=1 → normalize over all T,C.
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -269,6 +310,14 @@ class MyGroupNorm(nn.GroupNorm):
 
 
 class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    """
+    Standard transformer encoder layer: self-attention + FFN, with optional:
+    - Sparse attention (mask) to reduce O(n²) cost
+    - GroupNorm instead of LayerNorm
+    - LayerScale on residuals
+    - norm_first (Pre-LN) or post-LN
+    Used for SELF-attention within each branch (freq or time).
+    """
     def __init__(
         self,
         d_model,
@@ -378,6 +427,12 @@ class MyTransformerEncoderLayer(nn.TransformerEncoderLayer):
 
 
 class CrossTransformerEncoderLayer(nn.Module):
+    """
+    Cross-attention layer: Q from one branch, K/V from the other.
+    Output = Q + cross_attn(norm(Q), norm(K)) + FFN(norm(...))
+    Enables information flow BETWEEN freq and time branches.
+    No self-attention — only cross-attention + FFN.
+    """
     def __init__(
         self,
         d_model: int,
@@ -465,11 +520,8 @@ class CrossTransformerEncoderLayer(nn.Module):
 
     def forward(self, q, k, mask=None):
         """
-        Args:
-            q: tensor of shape (T, B, C)
-            k: tensor of shape (S, B, C)
-            mask: tensor of shape (T, S)
-
+        Cross-attention: out = f(q, k). Q has len T, K/V have len S (can differ).
+        mask (T, S): True = attend, False = mask out.
         """
         device = q.device
         T, B, C = q.shape
@@ -501,13 +553,13 @@ class CrossTransformerEncoderLayer(nn.Module):
 
         return x
 
-    # self-attention block
     def _ca_block(self, q, k, attn_mask=None):
+        """Cross-attention: Q from one branch, K/V from the other. Returns attended values."""
         x = self.cross_attn(q, k, k, attn_mask=attn_mask, need_weights=False)[0]
         return self.dropout1(x)
 
-    # feed forward block
     def _ff_block(self, x):
+        """Standard FFN: Linear -> GELU/ReLU -> Dropout -> Linear."""
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
@@ -520,18 +572,30 @@ class CrossTransformerEncoderLayer(nn.Module):
         raise RuntimeError("activation should be relu/gelu, not {}".format(activation))
 
 
-# ----------------- MULTI-BLOCKS MODELS: -----------------------
+# ---------------------------------------------------------------------------
+# CrossTransformerEncoder: Main module used in HTDemucs bottleneck
+# ---------------------------------------------------------------------------
 
 
 class CrossTransformerEncoder(nn.Module):
+    """
+    Fuses frequency (spectrogram) and time (waveform) branches via alternating layers:
+      - Self-attention layers: each branch attends to itself (global context within branch)
+      - Cross-attention layers: freq attends to time, time attends to freq (cross-domain flow)
+
+    Input:  x = (B, C, Fr, T) freq branch,  xt = (B, C, T) time branch
+    Output: same shapes, enriched with information from the other branch.
+
+    classic_parity controls which layer type is first: idx%2==parity → self-attn, else cross-attn.
+    """
     def __init__(
         self,
         dim: int,
-        emb: str = "sin",
+        emb: str = "sin",        # "sin" | "cape" | "scaled" for positional encoding
         hidden_scale: float = 4.0,
         num_heads: int = 8,
         num_layers: int = 6,
-        cross_first: bool = False,
+        cross_first: bool = False,  # If True, layer 0 is cross-attn; else self-attn first
         dropout: float = 0.0,
         max_positions: int = 1000,
         norm_in: bool = True,
@@ -559,15 +623,11 @@ class CrossTransformerEncoder(nn.Module):
         sparsity: float = 0.95,
     ):
         super().__init__()
-        """
-        """
         assert dim % num_heads == 0
 
         hidden_dim = int(dim * hidden_scale)
-
         self.num_layers = num_layers
-        # classic parity = 1 means that if idx%2 == 1 there is a
-        # classical encoder else there is a cross encoder
+        # parity: 0 = even idx → self-attn, odd → cross-attn. 1 = opposite.
         self.classic_parity = 1 if cross_first else 0
         self.emb = emb
         self.max_period = max_period
@@ -585,6 +645,7 @@ class CrossTransformerEncoder(nn.Module):
 
         activation: tp.Any = F.gelu if gelu else F.relu
 
+        # Input norms for freq and time branches
         self.norm_in: nn.Module
         self.norm_in_t: nn.Module
         if norm_in:
@@ -597,10 +658,9 @@ class CrossTransformerEncoder(nn.Module):
             self.norm_in = nn.Identity()
             self.norm_in_t = nn.Identity()
 
-        # spectrogram layers
-        self.layers = nn.ModuleList()
-        # temporal layers
-        self.layers_t = nn.ModuleList()
+        # Parallel stacks: one for freq branch, one for time branch
+        self.layers = nn.ModuleList()      # freq branch layers
+        self.layers_t = nn.ModuleList()    # time branch layers
 
         kwargs_common = {
             "d_model": dim,
@@ -632,29 +692,28 @@ class CrossTransformerEncoder(nn.Module):
 
         for idx in range(num_layers):
             if idx % 2 == self.classic_parity:
-
+                # Self-attention: each branch processes independently
                 self.layers.append(MyTransformerEncoderLayer(**kwargs_classic_encoder))
                 self.layers_t.append(
                     MyTransformerEncoderLayer(**kwargs_classic_encoder)
                 )
-
             else:
+                # Cross-attention: branches exchange information
                 self.layers.append(CrossTransformerEncoderLayer(**kwargs_cross_encoder))
-
                 self.layers_t.append(
                     CrossTransformerEncoderLayer(**kwargs_cross_encoder)
                 )
 
     def forward(self, x, xt):
+        # ---- Freq branch: (B, C, Fr, T1) -> (B, Fr*T1, C) ----
         B, C, Fr, T1 = x.shape
-        pos_emb_2d = create_2d_sin_embedding(
-            C, Fr, T1, x.device, self.max_period
-        )  # (1, C, Fr, T1)
+        pos_emb_2d = create_2d_sin_embedding(C, Fr, T1, x.device, self.max_period)
         pos_emb_2d = rearrange(pos_emb_2d, "b c fr t1 -> b (t1 fr) c")
         x = rearrange(x, "b c fr t1 -> b (t1 fr) c")
         x = self.norm_in(x)
         x = x + self.weight_pos_embed * pos_emb_2d
 
+        # ---- Time branch: (B, C, T2) -> (B, T2, C) ----
         B, C, T2 = xt.shape
         xt = rearrange(xt, "b c t2 -> b t2 c")  # now T2, B, C
         pos_emb = self._get_pos_embedding(T2, B, C, x.device)
@@ -664,13 +723,16 @@ class CrossTransformerEncoder(nn.Module):
 
         for idx in range(self.num_layers):
             if idx % 2 == self.classic_parity:
+                # Self-attention: x and xt processed independently
                 x = self.layers[idx](x)
                 xt = self.layers_t[idx](xt)
             else:
+                # Cross-attention: x attends to xt, xt attends to x. Use old_x for symmetric swap.
                 old_x = x
                 x = self.layers[idx](x, xt)
                 xt = self.layers_t[idx](xt, old_x)
 
+        # ---- Reshape back to original layout for decoder ----
         x = rearrange(x, "b (t1 fr) c -> b c fr t1", t1=T1)
         xt = rearrange(xt, "b t2 c -> b c t2")
         return x, xt
@@ -719,10 +781,17 @@ class CrossTransformerEncoder(nn.Module):
         return group
 
 
-# Attention Modules
+# ---------------------------------------------------------------------------
+# Attention: MultiheadAttention and sparse variants
+# ---------------------------------------------------------------------------
 
 
 class MultiheadAttention(nn.Module):
+    """
+    Multi-head attention: Q,K,V from linear projections, then scaled dot-product
+    attention per head, then concat and project. Supports sparse attention via
+    attn_mask or auto_sparsity (LSH-based).
+    """
     def __init__(
         self,
         embed_dim,
@@ -801,6 +870,7 @@ class MultiheadAttention(nn.Module):
 
 
 def scaled_query_key_softmax(q, k, att_mask):
+    """Attention scores: softmax(QK^T / sqrt(d_k)), with optional sparse mask."""
     from xformers.ops import masked_matmul
     q = q / (k.size(-1)) ** 0.5
     att = masked_matmul(q, k.transpose(-2, -1), att_mask)
@@ -809,6 +879,7 @@ def scaled_query_key_softmax(q, k, att_mask):
 
 
 def scaled_dot_product_attention(q, k, v, att_mask, dropout):
+    """Standard attention: Attention(Q,K,V) = softmax(QK^T/sqrt(d)) @ V."""
     att = scaled_query_key_softmax(q, k, att_mask=att_mask)
     att = dropout(att)
     y = att @ v
@@ -816,6 +887,7 @@ def scaled_dot_product_attention(q, k, v, att_mask, dropout):
 
 
 def _compute_buckets(x, R):
+    """LSH bucket assignment for sparse attention: hash Q/K to buckets."""
     qq = torch.einsum('btf,bfhi->bhti', x, R)
     qq = torch.cat([qq, -qq], dim=-1)
     buckets = qq.argmax(dim=-1)
@@ -824,7 +896,11 @@ def _compute_buckets(x, R):
 
 
 def dynamic_sparse_attention(query, key, value, sparsity, infer_sparsity=True, attn_bias=None):
-    # assert False, "The code for the custom sparse kernel is not ready for release yet."
+    """
+    Sparse attention via LSH (Locality-Sensitive Hashing): only attend to keys
+    in the same bucket as query. Reduces O(n²) to ~O(n) for long sequences.
+    Uses xformers sparse kernels.
+    """
     from xformers.ops import find_locations, sparse_memory_efficient_attention
     n_hashes = 32
     proj_size = 4
