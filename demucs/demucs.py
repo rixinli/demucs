@@ -175,7 +175,7 @@ class DConv(nn.Module):
             if lstm:
                 mods.insert(3, BLSTM(hidden, layers=2, max_steps=200, skip=True))
             layer = nn.Sequential(*mods)
-            self.layers.append(layer)
+            self.layers.append(layer)   
 
     def forward(self, x):
         # Residual: x + branch(x) for each sub-layer
